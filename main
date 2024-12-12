@@ -1,0 +1,461 @@
+#include <Wire.h>          
+#include <RTClib.h>        
+#include <LedControl.h>    
+#include <SPI.h>
+#include <Adafruit_GFX.h>  
+#include <Adafruit_SSD1306.h> 
+#include <EEPROM.h>
+
+
+// Définitions des broches et paramètres
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1  // Reset pin (-1 car on partage le reset Arduino)
+
+// Initialisation des composants
+RTC_DS1307 rtc;
+LedControl lc = LedControl(11, 13, 10, 4);  // DIN, CLK, CS, nombre de matrices
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Variables pour l'affichage
+int lastDisplayedMinute = -1;
+int lastDisplayedHour = -1;
+// Après les includes actuels
+
+
+
+//Je vais modifier le code précédent pour ajouter le système de menu. Commençons par ajouter les nouvelles définitions et états :
+// États du menu
+enum MenuState {
+    NORMAL_CLOCK,
+    MAIN_MENU,
+    SETTINGS_MENU,
+    SETTING_ALARM  // Nouvel état
+};
+
+
+// Options du menu principal
+enum MainMenuOption {
+    PARAMETRES,
+    RETOUR,
+    MAIN_MENU_OPTIONS_COUNT
+};
+
+// Options du menu paramètres
+enum SettingsMenuOption {
+    REGLER_ALARME,
+    FORMAT_HEURE,
+    RETOUR_MENU,
+    SETTINGS_MENU_OPTIONS_COUNT
+};
+
+// Variables globales à ajouter
+MenuState currentMenuState = NORMAL_CLOCK;
+int currentMainMenuSelection = 0;
+int currentSettingsMenuSelection = 0;
+
+// Pour le potentiomètre
+#define POT_PIN A0
+#define BUTTON_PIN 2
+int lastPotValue = 0;
+const int THRESHOLD = 8;  // Seuil pour éviter les fluctuations
+//fin
+// Ajoutez ces définitions au début
+
+
+#define ALARM_HOURS_ADDRESS 0
+#define ALARM_MINUTES_ADDRESS 1
+#define ALARM_STATE_ADDRESS 2
+
+struct AlarmTime {
+    int hours;
+    int minutes;
+    bool enabled;
+};
+
+AlarmTime alarmTime = {0, 0, false};
+
+// Ajouter un état pour le réglage de l'alarme
+enum SettingState {
+    SETTING_HOURS_TENS,    
+    SETTING_HOURS_UNITS,   
+    SETTING_MINUTES_TENS,  
+    SETTING_MINUTES_UNITS, 
+    NORMAL_MODE
+};
+// Variables additionnelles
+SettingState currentSettingState = NORMAL_MODE;
+int currentHoursTens = 0;
+int currentHoursUnits = 0;
+int currentMinutesTens = 0;
+int currentMinutesUnits = 0;
+
+// Variables pour le clignotement
+unsigned long previousBlinkMillis = 0;
+bool blinkState = false;
+const long blinkInterval = 500; // Intervalle de clignotement en ms
+
+// Définition des chiffres pour les matrices LED
+byte digits[10][8] = {
+    {0b00111100, 0b01100110, 0b01101110, 0b01110110, 0b01100110, 0b01100110, 0b00111100, 0b00000000},  // 0
+    {0b00011000, 0b00111000, 0b00011000, 0b00011000, 0b00011000, 0b00011000, 0b01111110, 0b00000000},  // 1
+    {0b00111100, 0b01100110, 0b00000110, 0b00001100, 0b00110000, 0b01100000, 0b01111110, 0b00000000},  // 2
+    {0b00111100, 0b01100110, 0b00000110, 0b00011100, 0b00000110, 0b01100110, 0b00111100, 0b00000000},  // 3
+    {0b00001100, 0b00011100, 0b00101100, 0b01001100, 0b01111110, 0b00001100, 0b00011110, 0b00000000},  // 4
+    {0b01111110, 0b01100000, 0b01111100, 0b00000110, 0b00000110, 0b01100110, 0b00111100, 0b00000000},  // 5
+    {0b00111100, 0b01100110, 0b01100000, 0b01111100, 0b01100110, 0b01100110, 0b00111100, 0b00000000},  // 6
+    {0b01111110, 0b01100110, 0b00000110, 0b00001100, 0b00011000, 0b00011000, 0b00011000, 0b00000000},  // 7
+    {0b00111100, 0b01100110, 0b01100110, 0b00111100, 0b01100110, 0b01100110, 0b00111100, 0b00000000},  // 8
+    {0b00111100, 0b01100110, 0b01100110, 0b00111110, 0b00000110, 0b01100110, 0b00111100, 0b00000000}   // 9
+};
+
+void displayDigit(int matrix, int number) {
+    if (number >= 0 && number <= 9) {
+        for (int row = 0; row < 8; row++) {
+            lc.setRow(matrix, row, digits[number][row]);
+        }
+    }
+}
+
+void displayTime(int hoursTens, int hoursUnits, int minutesTens, int minutesUnits) {
+    displayDigit(3, hoursTens);
+    displayDigit(2, hoursUnits);
+    displayDigit(1, minutesTens);
+    displayDigit(0, minutesUnits);
+}
+// Modifier updateOLED
+void updateOLED() {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0,0);
+    
+    switch(currentMenuState) {
+        case NORMAL_CLOCK:
+            displayNormalClock();
+            break;
+        case MAIN_MENU:
+            displayMainMenu();
+            break;
+        case SETTINGS_MENU:
+            displaySettingsMenu();
+            break;
+        case SETTING_ALARM:
+            displayAlarmSetting();
+            break;
+    }
+    
+    display.display();
+}
+// Modifier displayNormalClock pour afficher l'état de l'alarme
+void displayNormalClock() {
+    DateTime now = rtc.now();
+    display.println(F("Mode: Normal"));
+    display.print(F("Heure: "));
+    if(now.hour() < 10) display.print('0');
+    display.print(now.hour());
+    display.print(':');
+    if(now.minute() < 10) display.print('0');
+    display.println(now.minute());
+    
+    display.println();
+    display.print(F("Alarme: "));
+    if(alarmTime.enabled) {
+        if(alarmTime.hours < 10) display.print('0');
+        display.print(alarmTime.hours);
+        display.print(':');
+        if(alarmTime.minutes < 10) display.print('0');
+        display.print(alarmTime.minutes);
+        display.println(F(" ON"));
+    } else {
+        display.println(F("OFF"));
+    }
+}
+
+void displayMainMenu() {
+    display.println(F("MENU PRINCIPAL"));
+    display.println();
+    
+    const char* options[] = {"Parametres", "Retour"};
+    
+    for(int i = 0; i < MAIN_MENU_OPTIONS_COUNT; i++) {
+        if(i == currentMainMenuSelection) {
+            display.print(F("> "));  // Flèche pour l'option sélectionnée
+        } else {
+            display.print(F("  "));
+        }
+        display.println(options[i]);
+    }
+}
+
+void displaySettingsMenu() {
+    display.println(F("PARAMETRES"));
+    display.println();
+    
+    const char* options[] = {"Regler Alarme", "Format Heure", "Retour"};
+    
+    for(int i = 0; i < SETTINGS_MENU_OPTIONS_COUNT; i++) {
+        if(i == currentSettingsMenuSelection) {
+            display.print(F("> "));
+        } else {
+            display.print(F("  "));
+        }
+        display.println(options[i]);
+    }
+}
+void handleButton() {
+    static bool lastButtonState = HIGH;
+    bool buttonState = digitalRead(BUTTON_PIN);
+    
+    if(buttonState == LOW && lastButtonState == HIGH) {  // Button press
+        delay(50);  // debounce
+        processButtonPress();
+    }
+    lastButtonState = buttonState;
+}
+// Ajoutez à l'enum MenuState
+// Variables pour le clignotement
+
+
+
+// Variables pour le clignotement
+
+// Fonction pour gérer le clignotement pendant le réglage
+void handleAlarmSetting() {
+    // Gestion du potentiomètre
+    int potValue = analogRead(POT_PIN);
+    if(abs(potValue - lastPotValue) > THRESHOLD) {
+        switch(currentSettingState) {
+            case SETTING_HOURS_TENS:
+                currentHoursTens = map(potValue, 0, 1023, 0, 3);
+                if(currentHoursTens == 2 && currentHoursUnits > 3) {
+                    currentHoursUnits = 3;
+                }
+                break;
+            case SETTING_HOURS_UNITS:
+                if(currentHoursTens == 2) {
+                    currentHoursUnits = map(potValue, 0, 1023, 0, 4);
+                } else {
+                    currentHoursUnits = map(potValue, 0, 1023, 0, 10);
+                }
+                break;
+            case SETTING_MINUTES_TENS:
+                currentMinutesTens = map(potValue, 0, 1023, 0, 6);
+                break;
+            case SETTING_MINUTES_UNITS:
+                currentMinutesUnits = map(potValue, 0, 1023, 0, 10);
+                break;
+        }
+        lastPotValue = potValue;
+        updateOLED();
+    }
+
+    // Gestion du clignotement
+    unsigned long currentMillis = millis();
+    if (currentMillis - previousBlinkMillis >= blinkInterval) {
+        previousBlinkMillis = currentMillis;
+        blinkState = !blinkState;
+        
+        if (blinkState) {
+            // Affiche tous les chiffres
+            displayTime(currentHoursTens, currentHoursUnits, 
+                       currentMinutesTens, currentMinutesUnits);
+        } else {
+            // Cache le chiffre en cours de modification
+            switch(currentSettingState) {
+                case SETTING_HOURS_TENS:
+                    displayTime(-1, currentHoursUnits, 
+                              currentMinutesTens, currentMinutesUnits);
+                    break;
+                case SETTING_HOURS_UNITS:
+                    displayTime(currentHoursTens, -1, 
+                              currentMinutesTens, currentMinutesUnits);
+                    break;
+                case SETTING_MINUTES_TENS:
+                    displayTime(currentHoursTens, currentHoursUnits, 
+                              -1, currentMinutesUnits);
+                    break;
+                case SETTING_MINUTES_UNITS:
+                    displayTime(currentHoursTens, currentHoursUnits, 
+                              currentMinutesTens, -1);
+                    break;
+            }
+        }
+    }
+}
+
+void displayAlarmSetting() {
+    display.println(F("REGLAGE ALARME"));
+    display.println();
+    display.print(F("Heure: "));
+    display.print(currentHoursTens);
+    display.print(currentHoursUnits);
+    display.print(F(":"));
+    display.print(currentMinutesTens);
+    display.println(currentMinutesUnits);
+    
+    display.println();
+    switch(currentSettingState) {
+        case SETTING_HOURS_TENS:
+            display.println(F("Reglage: Heures (10)"));
+            break;
+        case SETTING_HOURS_UNITS:
+            display.println(F("Reglage: Heures (1)"));
+            break;
+        case SETTING_MINUTES_TENS:
+            display.println(F("Reglage: Minutes (10)"));
+            break;
+        case SETTING_MINUTES_UNITS:
+            display.println(F("Reglage: Minutes (1)"));
+            break;
+    }
+}
+
+void saveAlarmToEEPROM() {
+    alarmTime.hours = currentHoursTens * 10 + currentHoursUnits;
+    alarmTime.minutes = currentMinutesTens * 10 + currentMinutesUnits;
+    alarmTime.enabled = true;
+    
+    EEPROM.write(ALARM_HOURS_ADDRESS, alarmTime.hours);
+    EEPROM.write(ALARM_MINUTES_ADDRESS, alarmTime.minutes);
+    EEPROM.write(ALARM_STATE_ADDRESS, alarmTime.enabled);
+}
+
+void loadAlarmFromEEPROM() {
+    alarmTime.hours = EEPROM.read(ALARM_HOURS_ADDRESS);
+    alarmTime.minutes = EEPROM.read(ALARM_MINUTES_ADDRESS);
+    alarmTime.enabled = EEPROM.read(ALARM_STATE_ADDRESS);
+}
+// Modifier processButtonPress
+void processButtonPress() {
+    switch(currentMenuState) {
+        case NORMAL_CLOCK:
+            currentMenuState = MAIN_MENU;
+            break;
+            
+        case MAIN_MENU:
+            switch(currentMainMenuSelection) {
+                case PARAMETRES:
+                    currentMenuState = SETTINGS_MENU;
+                    break;
+                case RETOUR:
+                    currentMenuState = NORMAL_CLOCK;
+                    break;
+            }
+            break;
+            
+        case SETTINGS_MENU:
+            switch(currentSettingsMenuSelection) {
+                case REGLER_ALARME:
+                    currentMenuState = SETTING_ALARM;
+                    currentSettingState = SETTING_HOURS_TENS;
+                    // Initialiser avec l'heure actuelle
+                    currentHoursTens = alarmTime.hours / 10;
+                    currentHoursUnits = alarmTime.hours % 10;
+                    currentMinutesTens = alarmTime.minutes / 10;
+                    currentMinutesUnits = alarmTime.minutes % 10;
+                    break;
+                case RETOUR_MENU:
+                    currentMenuState = MAIN_MENU;
+                    break;
+            }
+            break;
+            
+        case SETTING_ALARM:
+            switch(currentSettingState) {
+                case SETTING_HOURS_TENS:
+                    currentSettingState = SETTING_HOURS_UNITS;
+                    break;
+                case SETTING_HOURS_UNITS:
+                    currentSettingState = SETTING_MINUTES_TENS;
+                    break;
+                case SETTING_MINUTES_TENS:
+                    currentSettingState = SETTING_MINUTES_UNITS;
+                    break;
+                case SETTING_MINUTES_UNITS:
+                    saveAlarmToEEPROM();
+                    currentMenuState = SETTINGS_MENU;
+                    currentSettingState = NORMAL_MODE;
+                    break;
+            }
+            break;
+    }
+    updateOLED();
+}
+void handleMenuNavigation() {
+    int potValue = analogRead(POT_PIN);
+    if(abs(potValue - lastPotValue) > THRESHOLD) {
+        if(currentMenuState == MAIN_MENU) {
+            currentMainMenuSelection = map(potValue, 0, 1023, 0, MAIN_MENU_OPTIONS_COUNT);
+            updateOLED();
+        }
+        else if(currentMenuState == SETTINGS_MENU) {
+            currentSettingsMenuSelection = map(potValue, 0, 1023, 0, SETTINGS_MENU_OPTIONS_COUNT);
+            updateOLED();
+        }
+        lastPotValue = potValue;
+    }
+}
+
+void setup() {
+    Serial.begin(9600);
+    
+    // Initialisation de l'écran OLED
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println(F("Erreur OLED"));
+        while(1);
+    }
+    display.clearDisplay();
+    
+    // Initialisation du RTC
+    if (!rtc.begin()) {
+        Serial.println("RTC non détecté");
+        while(1);
+    }
+    if (!rtc.isrunning()) {
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+    
+    // Initialisation des matrices LED
+    for(int i = 0; i < 4; i++) {
+        lc.shutdown(i, false);  // Sort du mode shutdown
+        lc.setIntensity(i, 8);  // Luminosité moyenne (0-15)
+        lc.clearDisplay(i);     // Efface l'affichage
+    }
+    
+    // Test initial des matrices
+    for(int digit = 0; digit < 10; digit++) {
+        for(int matrix = 0; matrix < 4; matrix++) {
+            displayDigit(matrix, digit);
+        }
+        delay(500);
+    }
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(POT_PIN, INPUT);
+    lastPotValue = analogRead(POT_PIN);
+
+}
+
+
+void loop() {
+    DateTime now = rtc.now();
+    
+    if(currentMenuState == NORMAL_CLOCK) {
+        if (now.minute() != lastDisplayedMinute || now.hour() != lastDisplayedHour) {
+            // Modification ici pour utiliser la nouvelle version de displayTime
+            displayTime(now.hour()/10, now.hour()%10, 
+                       now.minute()/10, now.minute()%10);
+            updateOLED();
+            lastDisplayedMinute = now.minute();
+            lastDisplayedHour = now.hour();
+        }
+        lc.setLed(1, 7, 7, now.second() % 2);
+    } else if(currentMenuState == SETTING_ALARM) {
+        handleAlarmSetting();
+    } else {
+        handleMenuNavigation();
+    }
+    
+    handleButton();
+    delay(10);
+}
